@@ -5,6 +5,7 @@ from urllib.parse import urlsplit
 import anyio
 from httpcore import (
     AsyncNetworkBackend,
+    AsyncNetworkStream,
     ConnectError,
     ConnectTimeout,
 )
@@ -14,6 +15,72 @@ from webhawk.core.safety import (
     TargetPolicy,
     authorize_target,
 )
+
+
+class DeadlineAwareNetworkStream(AsyncNetworkStream):
+    """Preserve the connection deadline across TCP and TLS."""
+
+    def __init__(
+        self,
+        stream: AsyncNetworkStream,
+        deadline: float,
+    ) -> None:
+        self._stream = stream
+        self._deadline = deadline
+
+    async def read(
+        self,
+        max_bytes: int,
+        timeout: float | None = None,
+    ) -> bytes:
+        return await self._stream.read(
+            max_bytes,
+            timeout=timeout,
+        )
+
+    async def write(
+        self,
+        buffer: bytes,
+        timeout: float | None = None,
+    ) -> None:
+        await self._stream.write(
+            buffer,
+            timeout=timeout,
+        )
+
+    async def aclose(self) -> None:
+        await self._stream.aclose()
+
+    def get_extra_info(self, info: str):
+        return self._stream.get_extra_info(info)
+
+    async def start_tls(
+        self,
+        ssl_context,
+        server_hostname: str | None = None,
+        timeout: float | None = None,
+    ) -> AsyncNetworkStream:
+        remaining = self._deadline - anyio.current_time()
+
+        if timeout is not None:
+            remaining = min(remaining, timeout)
+
+        if remaining <= 0:
+            raise ConnectTimeout(
+                "Connection timeout budget exhausted before TLS negotiation."
+            )
+
+        stream = await self._stream.start_tls(
+            ssl_context,
+            server_hostname=server_hostname,
+            timeout=remaining,
+        )
+
+        return DeadlineAwareNetworkStream(
+            stream,
+            self._deadline,
+        )
+
 
 
 class IPPinnedNetworkBackend(AsyncNetworkBackend):
@@ -118,13 +185,22 @@ class IPPinnedNetworkBackend(AsyncNetworkBackend):
                 ) from last_error
 
             try:
-                return await self._backend.connect_tcp(
+                stream = await self._backend.connect_tcp(
                     host=address,
                     port=port,
                     timeout=remaining,
                     local_address=local_address,
                     socket_options=socket_options,
                 )
+
+                if deadline is None:
+                    return stream
+
+                return DeadlineAwareNetworkStream(
+                    stream,
+                    deadline,
+                )
+
             except (ConnectError, ConnectTimeout) as exc:
                 last_error = exc
 

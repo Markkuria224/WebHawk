@@ -1,4 +1,5 @@
 import asyncio
+import ssl
 
 import httpcore
 import httpx
@@ -1019,5 +1020,52 @@ def test_sync_only_request_stream_is_rejected_and_closed(
 
     assert stream.closed is True
     assert pools[0].requests == []
+
+    asyncio.run(transport.aclose())
+
+
+def test_transport_rejects_ssl_context_without_certificate_verification(
+    transport_factory,
+):
+    create_transport, _ = transport_factory
+
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+
+    with pytest.raises(
+        ValueError,
+        match="require certificate verification",
+    ):
+        create_transport(ssl_context=context)
+
+
+def test_transport_rejects_ssl_context_without_hostname_verification(
+    transport_factory,
+):
+    create_transport, _ = transport_factory
+
+    context = ssl.create_default_context()
+    context.check_hostname = False
+
+    with pytest.raises(
+        ValueError,
+        match="enable hostname verification",
+    ):
+        create_transport(ssl_context=context)
+
+
+def test_transport_preserves_secure_custom_ssl_context(
+    transport_factory,
+):
+    create_transport, pools = transport_factory
+
+    context = ssl.create_default_context()
+
+    transport = create_transport(ssl_context=context)
+
+    assert pools[0].kwargs["ssl_context"] is context
+    assert context.verify_mode == ssl.CERT_REQUIRED
+    assert context.check_hostname is True
 
     asyncio.run(transport.aclose())

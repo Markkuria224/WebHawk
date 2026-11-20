@@ -12,6 +12,33 @@ DEFAULT_MAX_RESPONSE_BYTES = 10 * 1024 * 1024
 DEFAULT_MAX_REQUEST_BYTES = 10 * 1024 * 1024
 
 
+def _validate_ssl_context(
+    ssl_context: ssl.SSLContext | None,
+) -> ssl.SSLContext:
+    """Return a secure SSL context or reject insecure configuration."""
+
+    context = (
+        ssl_context
+        if ssl_context is not None
+        else ssl.create_default_context()
+    )
+
+    if not isinstance(context, ssl.SSLContext):
+        raise TypeError("ssl_context must be an SSLContext.")
+
+    if context.verify_mode != ssl.CERT_REQUIRED:
+        raise ValueError(
+            "SSL context must require certificate verification."
+        )
+
+    if not context.check_hostname:
+        raise ValueError(
+            "SSL context must enable hostname verification."
+        )
+
+    return context
+
+
 class ResponseTooLargeError(httpx.TransportError):
     """Raised when an HTTP response exceeds the configured size limit."""
 
@@ -199,12 +226,10 @@ class WebHawkAsyncTransport(httpx.AsyncBaseTransport):
             resolver=resolver,
         )
 
+        validated_ssl_context = _validate_ssl_context(ssl_context)
+
         self._pool = httpcore.AsyncConnectionPool(
-            ssl_context=(
-                ssl_context
-                if ssl_context is not None
-                else ssl.create_default_context()
-            ),
+            ssl_context=validated_ssl_context,
             max_connections=max_connections,
             max_keepalive_connections=max_keepalive_connections,
             keepalive_expiry=keepalive_expiry,

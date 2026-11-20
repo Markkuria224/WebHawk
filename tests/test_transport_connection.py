@@ -7,7 +7,10 @@ from webhawk.core.safety import (
     TargetNotAuthorizedError,
     TargetPolicy,
 )
-from webhawk.core.transport.connection import IPPinnedNetworkBackend
+from webhawk.core.transport.connection import (
+    DeadlineAwareNetworkStream,
+    IPPinnedNetworkBackend,
+)
 
 
 TARGET_URL = "https://lab.example.com"
@@ -357,7 +360,8 @@ def test_fallback_attempts_share_one_timeout_budget():
 
     result = anyio.run(run_test)
 
-    assert result == "connected"
+    assert result.__class__.__name__ == "DeadlineAwareNetworkStream"
+    assert result._stream == "connected"
     assert len(backend.connections) == 2
     assert backend.connections[0]["timeout"] == pytest.approx(1.0, abs=0.001)
     assert backend.connections[1]["timeout"] < 1.0
@@ -399,3 +403,134 @@ def test_exhausted_timeout_budget_prevents_fallback():
     anyio.run(run_test)
 
     assert len(backend.connections) == 1
+
+
+class FakeTLSStream:
+    def __init__(self, behavior=None):
+        self.behavior = behavior
+        self.start_tls_calls = []
+
+    async def read(self, max_bytes, timeout=None):
+        return b""
+
+    async def write(self, buffer, timeout=None):
+        pass
+
+    async def aclose(self):
+        pass
+
+    def get_extra_info(self, info):
+        return None
+
+    async def start_tls(
+        self,
+        ssl_context,
+        server_hostname=None,
+        timeout=None,
+    ):
+        self.start_tls_calls.append({
+            "ssl_context": ssl_context,
+            "server_hostname": server_hostname,
+            "timeout": timeout,
+        })
+
+        if self.behavior is not None:
+            return await self.behavior(timeout)
+
+        return self
+
+
+def test_tls_receives_only_remaining_connection_timeout():
+    async def run_test():
+        deadline = anyio.current_time() + 1.0
+        underlying = FakeTLSStream()
+
+        wrapper = DeadlineAwareNetworkStream(
+            underlying,
+            deadline,
+        )
+
+        await anyio.sleep(0.05)
+
+        await wrapper.start_tls(
+            ssl_context=None,
+            server_hostname="lab.example.com",
+            timeout=1.0,
+        )
+
+        received_timeout = underlying.start_tls_calls[0]["timeout"]
+
+        assert received_timeout < 1.0
+        assert received_timeout > 0.80
+
+    anyio.run(run_test)
+
+
+def test_expired_deadline_prevents_tls_negotiation():
+    async def run_test():
+        underlying = FakeTLSStream()
+
+        wrapper = DeadlineAwareNetworkStream(
+            underlying,
+            anyio.current_time() - 0.01,
+        )
+
+        with pytest.raises(ConnectTimeout):
+            await wrapper.start_tls(
+                ssl_context=None,
+                server_hostname="lab.example.com",
+                timeout=1.0,
+            )
+
+        assert underlying.start_tls_calls == []
+
+    anyio.run(run_test)
+
+
+def test_tls_connect_timeout_propagates():
+    async def run_test(timeout):
+        raise ConnectTimeout("TLS negotiation timed out.")
+
+    async def main():
+        underlying = FakeTLSStream(behavior=run_test)
+
+        wrapper = DeadlineAwareNetworkStream(
+            underlying,
+            anyio.current_time() + 1.0,
+        )
+
+        with pytest.raises(ConnectTimeout, match="TLS negotiation"):
+            await wrapper.start_tls(
+                ssl_context=None,
+                server_hostname="lab.example.com",
+                timeout=1.0,
+            )
+
+        assert len(underlying.start_tls_calls) == 1
+
+    anyio.run(main)
+
+
+def test_cancellation_during_tls_propagates():
+    async def run_test(timeout):
+        await anyio.sleep_forever()
+
+    async def main():
+        underlying = FakeTLSStream(behavior=run_test)
+
+        wrapper = DeadlineAwareNetworkStream(
+            underlying,
+            anyio.current_time() + 5.0,
+        )
+
+        with anyio.move_on_after(0.05) as scope:
+            await wrapper.start_tls(
+                ssl_context=None,
+                server_hostname="lab.example.com",
+                timeout=5.0,
+            )
+
+        assert scope.cancel_called
+        assert len(underlying.start_tls_calls) == 1
+
+    anyio.run(main)
