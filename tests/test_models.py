@@ -8,6 +8,8 @@ from webhawk.core.models import (
     Evidence,
     Finding,
     FindingClassification,
+    HTTPHeader,
+    HTTPResponseMetadata,
     ScanResult,
     ScanStatus,
     ScanTarget,
@@ -111,3 +113,279 @@ def test_finding_is_immutable():
 
     with pytest.raises(ValidationError):
         finding.title = "Modified title"
+
+
+def make_response_metadata(**overrides):
+    values = {
+        "requested_url": "https://example.com",
+        "response_url": "https://example.com/",
+        "status_code": 200,
+        "http_version": "HTTP/1.1",
+        "headers": (
+            HTTPHeader(name="Content-Type", value="text/html"),
+            HTTPHeader(name="X-Frame-Options", value="DENY"),
+        ),
+        "elapsed_ms": 125.5,
+    }
+    values.update(overrides)
+    return HTTPResponseMetadata(**values)
+
+
+def test_response_metadata_accepts_valid_response():
+    metadata = make_response_metadata()
+
+    assert metadata.status_code == 200
+    assert metadata.http_version == "HTTP/1.1"
+    assert metadata.elapsed_ms == 125.5
+    assert metadata.received_at.tzinfo is not None
+
+
+def test_response_metadata_preserves_duplicate_headers():
+    metadata = make_response_metadata(
+        headers=(
+            HTTPHeader(name="Set-Cookie", value="session=first"),
+            HTTPHeader(name="Set-Cookie", value="session=second"),
+        )
+    )
+
+    assert len(metadata.headers) == 2
+    assert metadata.headers[0].name == "Set-Cookie"
+    assert metadata.headers[1].name == "Set-Cookie"
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "Cookie",
+        "Set-Cookie",
+        "Authorization",
+        "Proxy-Authorization",
+        "authorization",
+        "SET-COOKIE",
+    ],
+)
+def test_sensitive_header_values_are_redacted(name):
+    header = HTTPHeader(name=name, value="sensitive-secret")
+
+    assert header.value == "[REDACTED]"
+
+
+def test_non_sensitive_header_values_are_preserved():
+    header = HTTPHeader(
+        name="Content-Type",
+        value="text/html; charset=utf-8",
+    )
+
+    assert header.value == "text/html; charset=utf-8"
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["bad" + chr(13) + "value", "bad" + chr(10) + "value"],
+)
+def test_header_rejects_newline_characters(value):
+    with pytest.raises(ValidationError):
+        HTTPHeader(name="X-Test", value=value)
+
+
+def test_response_metadata_rejects_invalid_status_code():
+    with pytest.raises(ValidationError):
+        make_response_metadata(status_code=99)
+
+
+def test_response_metadata_rejects_negative_elapsed_time():
+    with pytest.raises(ValidationError):
+        make_response_metadata(elapsed_ms=-1)
+
+
+def test_response_metadata_rejects_naive_timestamp():
+    with pytest.raises(ValidationError):
+        make_response_metadata(received_at=datetime(2026, 1, 1))
+
+
+def test_response_metadata_rejects_too_many_headers():
+    headers = tuple(
+        HTTPHeader(name=f"X-Test-{index}", value="value")
+        for index in range(201)
+    )
+
+    with pytest.raises(ValidationError):
+        make_response_metadata(headers=headers)
+
+
+def test_response_metadata_is_immutable():
+    metadata = make_response_metadata()
+
+    with pytest.raises(ValidationError):
+        metadata.status_code = 404
+
+
+def test_response_headers_are_immutable_collection():
+    metadata = make_response_metadata()
+
+    assert isinstance(metadata.headers, tuple)
+
+    with pytest.raises(ValidationError):
+        metadata.headers = ()
+
+
+def test_response_metadata_rejects_unknown_fields():
+    with pytest.raises(ValidationError):
+        make_response_metadata(unexpected_field="value")
+
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "X Test",
+        "X@Test",
+        "X:Test",
+        "X/Test",
+        "X\\Test",
+        "X_Test\\n",
+        "X-T?st",
+    ],
+)
+def test_header_rejects_invalid_names(name):
+    with pytest.raises(ValidationError):
+        HTTPHeader(name=name, value="value")
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "X-Test",
+        "Content-Type",
+        "X_Custom",
+        "ETag",
+        "WWW-Authenticate",
+    ],
+)
+def test_header_accepts_valid_names(name):
+    header = HTTPHeader(name=name, value="value")
+    assert header.name == name
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "bad" + chr(0) + "value",
+        "bad" + chr(8) + "value",
+        "bad" + chr(10) + "value",
+        "bad" + chr(13) + "value",
+        "bad" + chr(127) + "value",
+    ],
+)
+def test_header_rejects_prohibited_control_characters(value):
+    with pytest.raises(ValidationError):
+        HTTPHeader(name="X-Test", value=value)
+
+
+def test_header_allows_horizontal_tab():
+    header = HTTPHeader(name="X-Test", value="first\tsecond")
+    assert header.value == "first\tsecond"
+
+
+def test_sensitive_headers_remain_redacted_in_dictionary_serialization():
+    metadata = make_response_metadata(
+        headers=(
+            HTTPHeader(name="Set-Cookie", value="session=secret"),
+            HTTPHeader(name="Authorization", value="Bearer secret"),
+        )
+    )
+
+    serialized = metadata.model_dump()
+
+    assert serialized["headers"][0]["value"] == "[REDACTED]"
+    assert serialized["headers"][1]["value"] == "[REDACTED]"
+    assert "session=secret" not in str(serialized)
+    assert "Bearer secret" not in str(serialized)
+
+
+def test_sensitive_headers_remain_redacted_in_json_serialization():
+    metadata = make_response_metadata(
+        headers=(
+            HTTPHeader(name="Set-Cookie", value="session=secret"),
+            HTTPHeader(name="Cookie", value="account=secret"),
+        )
+    )
+
+    serialized = metadata.model_dump_json()
+
+    assert "session=secret" not in serialized
+    assert "account=secret" not in serialized
+    assert "[REDACTED]" in serialized
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://admin:secret@example.com/",
+        "https://admin@example.com/",
+        "https://:secret@example.com/",
+    ],
+)
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "requested_url",
+        "response_url",
+    ],
+)
+def test_response_metadata_rejects_embedded_url_credentials(
+    url,
+    field_name,
+):
+    with pytest.raises(ValidationError, match="embedded credentials"):
+        make_response_metadata(**{field_name: url})
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://example.com/account?api_key=SECRET123",
+        "https://example.com/account?session=ABC#profile",
+        "https://example.com/path?token=secret&user=mark",
+        "https://example.com/path#sensitive-fragment",
+    ],
+)
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "requested_url",
+        "response_url",
+    ],
+)
+def test_response_metadata_removes_query_and_fragment(url, field_name):
+    metadata = make_response_metadata(**{field_name: url})
+
+    stored_url = str(getattr(metadata, field_name))
+
+    assert "?" not in stored_url
+    assert "#" not in stored_url
+    assert "SECRET123" not in stored_url
+    assert "session=ABC" not in stored_url
+    assert "token=secret" not in stored_url
+
+
+def test_response_metadata_preserves_url_path_and_port():
+    metadata = make_response_metadata(
+        requested_url="https://example.com:8443/admin/dashboard?token=secret",
+    )
+
+    assert str(metadata.requested_url) == (
+        "https://example.com:8443/admin/dashboard"
+    )
+
+
+def test_response_metadata_does_not_store_query_secrets_in_json():
+    metadata = make_response_metadata(
+        requested_url="https://example.com/?api_key=SUPERSECRET",
+        response_url="https://example.com/?session=PRIVATE",
+    )
+
+    serialized = metadata.model_dump_json()
+
+    assert "SUPERSECRET" not in serialized
+    assert "PRIVATE" not in serialized
+    assert "api_key" not in serialized
+    assert "session" not in serialized
