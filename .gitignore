@@ -1,4 +1,4 @@
-﻿# Python
+# Python
 __pycache__/
 *.py[cod]
 *.egg-info/
@@ -8,6 +8,7 @@ htmlcov/
 
 # Virtual environments
 .venv/
+.venv-tls/
 venv/
 env/
 
@@ -36,3 +37,5 @@ desktop.ini
 
 # Logs
 *.log
+# Local diagnostic artifacts
+build-tools-results.txt

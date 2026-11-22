@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+﻿from datetime import datetime, timezone
 from enum import StrEnum
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -40,6 +40,68 @@ class ScanStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
+class ScanErrorCode(StrEnum):
+    INVALID_TARGET = "invalid_target"
+    TARGET_NOT_AUTHORIZED = "target_not_authorized"
+    UNSAFE_ADDRESS = "unsafe_address"
+    DNS_RESOLUTION_FAILED = "dns_resolution_failed"
+    TLS_FAILED = "tls_failed"
+    CONNECTION_FAILED = "connection_failed"
+    REQUEST_TIMEOUT = "request_timeout"
+    RESPONSE_TOO_LARGE = "response_too_large"
+    CONFIGURATION_ERROR = "configuration_error"
+    ANALYSIS_FAILED = "analysis_failed"
+    UNEXPECTED_ERROR = "unexpected_error"
+
+
+SCAN_ERROR_MESSAGES = {
+    ScanErrorCode.INVALID_TARGET: "The supplied target URL is invalid.",
+    ScanErrorCode.TARGET_NOT_AUTHORIZED: "The target is not authorized for assessment.",
+    ScanErrorCode.UNSAFE_ADDRESS: "The target resolved to an address that violates the safety policy.",
+    ScanErrorCode.DNS_RESOLUTION_FAILED: "The target hostname could not be resolved.",
+    ScanErrorCode.TLS_FAILED: "A secure TLS connection could not be established.",
+    ScanErrorCode.CONNECTION_FAILED: "A connection to the target could not be established.",
+    ScanErrorCode.REQUEST_TIMEOUT: "The request exceeded its configured time limit.",
+    ScanErrorCode.RESPONSE_TOO_LARGE: "The target response exceeded the configured size limit.",
+    ScanErrorCode.CONFIGURATION_ERROR: "The assessment configuration is invalid or unsupported.",
+    ScanErrorCode.ANALYSIS_FAILED: "The response could not be analyzed successfully.",
+    ScanErrorCode.UNEXPECTED_ERROR: "The assessment failed because of an unexpected internal error.",
+}
+
+
+class ScanError(BaseModel):
+    """A safe, structured assessment failure."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    code: ScanErrorCode
+    message: str = Field(min_length=1, max_length=300)
+
+    @model_validator(mode="before")
+    @classmethod
+    def enforce_safe_message(cls, data):
+        if not isinstance(data, dict):
+            return data
+
+        try:
+            code = ScanErrorCode(data.get("code"))
+        except (ValueError, TypeError):
+            return data
+
+        expected_message = SCAN_ERROR_MESSAGES[code]
+        supplied_message = data.get("message")
+
+        if supplied_message is not None and supplied_message != expected_message:
+            raise ValueError(
+                "Scan error messages must use their predefined safe description."
+            )
+
+        data = dict(data)
+        data["message"] = expected_message
+
+        return data
+
+
 class Evidence(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -74,7 +136,6 @@ class HTTPHeader(BaseModel):
 
     @model_validator(mode="after")
     def validate_and_redact(self):
-        # RFC 9110 token characters used by HTTP field names.
         allowed_name_characters = (
             "!#$%&'*+-.^_`|~"
             "0123456789"
@@ -88,14 +149,14 @@ class HTTPHeader(BaseModel):
         ):
             raise ValueError("Invalid HTTP header name.")
 
-        # HTAB is permitted in field values. Other C0 controls and DEL
-        # are rejected to prevent unsafe or ambiguous header storage.
         if any(
             (ord(character) < 32 and character != "\t")
             or ord(character) == 127
             for character in self.value
         ):
-            raise ValueError("HTTP header values contain prohibited control characters.")
+            raise ValueError(
+                "HTTP header values contain prohibited control characters."
+            )
 
         sensitive_headers = {
             "cookie",
@@ -196,9 +257,10 @@ class ScanResult(BaseModel):
     started_at: datetime = Field(default_factory=utc_now)
     completed_at: datetime | None = None
     findings: list[Finding] = Field(default_factory=list)
+    error: ScanError | None = None
 
     @model_validator(mode="after")
-    def validate_timestamps(self):
+    def validate_scan_lifecycle(self):
         if self.started_at.tzinfo is None:
             raise ValueError("Start timestamp must include a timezone.")
 
@@ -208,5 +270,64 @@ class ScanResult(BaseModel):
 
             if self.completed_at < self.started_at:
                 raise ValueError("Completion cannot precede scan start.")
+
+        if self.status in {ScanStatus.PENDING, ScanStatus.RUNNING}:
+            if self.completed_at is not None:
+                raise ValueError(
+                    "Pending or running scans cannot have a completion timestamp."
+                )
+
+            if self.error is not None:
+                raise ValueError(
+                    "Pending or running scans cannot contain an error."
+                )
+
+            if self.findings:
+                raise ValueError(
+                    "Pending or running scans cannot contain findings."
+                )
+
+        elif self.status == ScanStatus.COMPLETED:
+            if self.completed_at is None:
+                raise ValueError(
+                    "Completed scans must have a completion timestamp."
+                )
+
+            if self.error is not None:
+                raise ValueError(
+                    "Completed scans cannot contain an error."
+                )
+
+        elif self.status == ScanStatus.FAILED:
+            if self.completed_at is None:
+                raise ValueError(
+                    "Failed scans must have a completion timestamp."
+                )
+
+            if self.error is None:
+                raise ValueError(
+                    "Failed scans must contain a structured error."
+                )
+
+            if self.findings:
+                raise ValueError(
+                    "Failed scans cannot retain partial findings."
+                )
+
+        elif self.status == ScanStatus.CANCELLED:
+            if self.completed_at is None:
+                raise ValueError(
+                    "Cancelled scans must have a completion timestamp."
+                )
+
+            if self.error is not None:
+                raise ValueError(
+                    "Cancelled scans cannot contain an error."
+                )
+
+            if self.findings:
+                raise ValueError(
+                    "Cancelled scans cannot retain partial findings."
+                )
 
         return self

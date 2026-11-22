@@ -9,6 +9,7 @@ from webhawk.core.safety import TargetPolicy
 from webhawk.core.transport.client import (
     HTTPXResponseStream,
     RequestBodyTooLargeError,
+    ResponseTooLargeError,
     WebHawkAsyncTransport,
 )
 from webhawk.core.transport.connection import IPPinnedNetworkBackend
@@ -1069,3 +1070,49 @@ def test_transport_preserves_secure_custom_ssl_context(
     assert context.check_hostname is True
 
     asyncio.run(transport.aclose())
+
+
+def test_response_stream_preserves_cancellation_when_cleanup_fails():
+    class FailingCloseResponse(FakeCoreResponse):
+        @staticmethod
+        async def _stream(body):
+            yield b"first"
+            raise asyncio.CancelledError()
+
+        async def aclose(self):
+            self.closed = True
+            raise RuntimeError("Simulated response cleanup failure.")
+
+    core_response = FailingCloseResponse()
+    stream = HTTPXResponseStream(core_response)
+
+    async def run():
+        with pytest.raises(asyncio.CancelledError):
+            async for _ in stream:
+                pass
+
+    asyncio.run(run())
+
+    assert core_response.closed is True
+
+def test_response_stream_preserves_size_error_when_cleanup_fails():
+    class FailingCloseResponse(FakeCoreResponse):
+        @staticmethod
+        async def _stream(body):
+            yield b"oversized response"
+
+        async def aclose(self):
+            self.closed = True
+            raise RuntimeError("Simulated response cleanup failure.")
+
+    core_response = FailingCloseResponse()
+    stream = HTTPXResponseStream(core_response, max_bytes=1)
+
+    async def run():
+        with pytest.raises(ResponseTooLargeError):
+            async for _ in stream:
+                pass
+
+    asyncio.run(run())
+
+    assert core_response.closed is True

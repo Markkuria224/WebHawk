@@ -22,7 +22,9 @@ class MalformedPortError(NormalizationError):
     """Raised when a port is malformed or outside its valid range."""
 
 
-def _normalize_hostname(hostname: str) -> str:
+def normalize_hostname(hostname: str) -> str:
+    """Normalize and validate a hostname using IDNA and IP canonicalization."""
+
     if not hostname:
         raise InvalidHostnameError("URL must contain a hostname.")
 
@@ -60,6 +62,12 @@ def _normalize_hostname(hostname: str) -> str:
             raise InvalidHostnameError("Hostname contains invalid characters.")
 
     return hostname
+
+
+def _normalize_hostname(hostname: str) -> str:
+    """Backward-compatible wrapper for the public hostname normalizer."""
+
+    return normalize_hostname(hostname)
 
 
 def normalize_url(value: str) -> str:

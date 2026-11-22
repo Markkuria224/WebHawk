@@ -70,7 +70,6 @@ class HTTPXResponseStream(httpx.AsyncByteStream):
                     next_total = self._bytes_received + len(chunk)
 
                     if next_total > self._max_bytes:
-                        await self.aclose()
                         raise ResponseTooLargeError(
                             "HTTP response size exceeds the configured limit.",
                             request=self._request,
@@ -81,7 +80,10 @@ class HTTPXResponseStream(httpx.AsyncByteStream):
                 yield chunk
 
         except BaseException:
-            await self.aclose()
+            try:
+                await self.aclose()
+            except BaseException:
+                pass
             raise
 
     async def aclose(self) -> None:

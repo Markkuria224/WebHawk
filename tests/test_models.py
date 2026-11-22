@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+﻿from datetime import datetime, timezone
 from uuid import UUID
 
 import pytest
@@ -10,6 +10,8 @@ from webhawk.core.models import (
     FindingClassification,
     HTTPHeader,
     HTTPResponseMetadata,
+    ScanError,
+    ScanErrorCode,
     ScanResult,
     ScanStatus,
     ScanTarget,
@@ -103,6 +105,7 @@ def test_scan_result_rejects_completion_before_start():
     with pytest.raises(ValidationError):
         ScanResult(
             target=ScanTarget(url="https://example.com"),
+            status=ScanStatus.COMPLETED,
             started_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
             completed_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
         )
@@ -389,3 +392,279 @@ def test_response_metadata_does_not_store_query_secrets_in_json():
     assert "PRIVATE" not in serialized
     assert "api_key" not in serialized
     assert "session" not in serialized
+
+
+
+# ---------------------------------------------------------------------------
+# Structured scan error tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("code", list(ScanErrorCode))
+def test_scan_error_uses_predefined_safe_message(code):
+    error = ScanError(code=code)
+
+    assert error.code == code
+    assert error.message
+    assert len(error.message) <= 300
+
+
+def test_scan_error_rejects_arbitrary_message():
+    with pytest.raises(ValidationError):
+        ScanError(
+            code=ScanErrorCode.CONNECTION_FAILED,
+            message="Connection failed: secret internal exception details",
+        )
+
+
+def test_scan_error_rejects_unknown_code():
+    with pytest.raises(ValidationError):
+        ScanError(code="arbitrary_error")
+
+
+def test_scan_error_is_immutable():
+    error = ScanError(code=ScanErrorCode.TLS_FAILED)
+
+    with pytest.raises(ValidationError):
+        error.message = "Modified error"
+
+
+def test_scan_error_json_contains_safe_message():
+    error = ScanError(code=ScanErrorCode.REQUEST_TIMEOUT)
+
+    serialized = error.model_dump_json()
+
+    assert error.message in serialized
+    assert "internal exception" not in serialized
+
+
+# ---------------------------------------------------------------------------
+# Scan lifecycle tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        ScanStatus.PENDING,
+        ScanStatus.RUNNING,
+    ],
+)
+def test_scan_result_accepts_in_progress_statuses(status):
+    result = ScanResult(
+        target=ScanTarget(url="https://example.com"),
+        status=status,
+    )
+
+    assert result.status == status
+    assert result.completed_at is None
+    assert result.error is None
+    assert result.findings == []
+
+
+def test_scan_result_accepts_completed_scan_with_findings():
+    started_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    completed_at = datetime(2026, 1, 2, tzinfo=timezone.utc)
+
+    result = ScanResult(
+        target=ScanTarget(url="https://example.com"),
+        status=ScanStatus.COMPLETED,
+        started_at=started_at,
+        completed_at=completed_at,
+        findings=[make_finding()],
+    )
+
+    assert result.status == ScanStatus.COMPLETED
+    assert len(result.findings) == 1
+    assert result.error is None
+
+def test_scan_result_accepts_completed_scan_without_findings():
+    result = ScanResult(
+        target=ScanTarget(url="https://example.com"),
+        status=ScanStatus.COMPLETED,
+        started_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            completed_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+    )
+
+    assert result.status == ScanStatus.COMPLETED
+    assert result.findings == []
+
+
+def test_scan_result_accepts_failed_scan_with_structured_error():
+    result = ScanResult(
+        target=ScanTarget(url="https://example.com"),
+        status=ScanStatus.FAILED,
+        started_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            completed_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+        error=ScanError(code=ScanErrorCode.CONNECTION_FAILED),
+    )
+
+    assert result.status == ScanStatus.FAILED
+    assert result.error.code == ScanErrorCode.CONNECTION_FAILED
+    assert result.findings == []
+
+
+def test_scan_result_accepts_cancelled_scan():
+    result = ScanResult(
+        target=ScanTarget(url="https://example.com"),
+        status=ScanStatus.CANCELLED,
+        started_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            completed_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+    )
+
+    assert result.status == ScanStatus.CANCELLED
+    assert result.error is None
+    assert result.findings == []
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        ScanStatus.PENDING,
+        ScanStatus.RUNNING,
+    ],
+)
+def test_scan_result_rejects_completion_timestamp_for_in_progress_scan(status):
+    with pytest.raises(ValidationError):
+        ScanResult(
+            target=ScanTarget(url="https://example.com"),
+            status=status,
+            started_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            completed_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+        )
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        ScanStatus.PENDING,
+        ScanStatus.RUNNING,
+    ],
+)
+def test_scan_result_rejects_error_for_in_progress_scan(status):
+    with pytest.raises(ValidationError):
+        ScanResult(
+            target=ScanTarget(url="https://example.com"),
+            status=status,
+            error=ScanError(code=ScanErrorCode.CONNECTION_FAILED),
+        )
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        ScanStatus.PENDING,
+        ScanStatus.RUNNING,
+    ],
+)
+def test_scan_result_rejects_findings_for_in_progress_scan(status):
+    with pytest.raises(ValidationError):
+        ScanResult(
+            target=ScanTarget(url="https://example.com"),
+            status=status,
+            findings=[make_finding()],
+        )
+
+
+def test_scan_result_rejects_completed_without_timestamp():
+    with pytest.raises(ValidationError):
+        ScanResult(
+            target=ScanTarget(url="https://example.com"),
+            status=ScanStatus.COMPLETED,
+        )
+
+
+def test_scan_result_rejects_completed_with_error():
+    with pytest.raises(ValidationError):
+        ScanResult(
+            target=ScanTarget(url="https://example.com"),
+            status=ScanStatus.COMPLETED,
+            started_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            completed_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+            error=ScanError(code=ScanErrorCode.CONNECTION_FAILED),
+        )
+
+
+def test_scan_result_rejects_failed_without_timestamp():
+    with pytest.raises(ValidationError):
+        ScanResult(
+            target=ScanTarget(url="https://example.com"),
+            status=ScanStatus.FAILED,
+            error=ScanError(code=ScanErrorCode.CONNECTION_FAILED),
+        )
+
+
+def test_scan_result_rejects_failed_without_error():
+    with pytest.raises(ValidationError):
+        ScanResult(
+            target=ScanTarget(url="https://example.com"),
+            status=ScanStatus.FAILED,
+            started_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            completed_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+        )
+
+
+def test_scan_result_rejects_failed_with_partial_findings():
+    with pytest.raises(ValidationError):
+        ScanResult(
+            target=ScanTarget(url="https://example.com"),
+            status=ScanStatus.FAILED,
+            started_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            completed_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+            error=ScanError(code=ScanErrorCode.ANALYSIS_FAILED),
+            findings=[make_finding()],
+        )
+
+
+def test_scan_result_rejects_cancelled_without_timestamp():
+    with pytest.raises(ValidationError):
+        ScanResult(
+            target=ScanTarget(url="https://example.com"),
+            status=ScanStatus.CANCELLED,
+        )
+
+
+def test_scan_result_rejects_cancelled_with_error():
+    with pytest.raises(ValidationError):
+        ScanResult(
+            target=ScanTarget(url="https://example.com"),
+            status=ScanStatus.CANCELLED,
+            started_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            completed_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+            error=ScanError(code=ScanErrorCode.CONNECTION_FAILED),
+        )
+
+
+def test_scan_result_rejects_cancelled_with_partial_findings():
+    with pytest.raises(ValidationError):
+        ScanResult(
+            target=ScanTarget(url="https://example.com"),
+            status=ScanStatus.CANCELLED,
+            started_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            completed_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+            findings=[make_finding()],
+        )
+
+
+def test_scan_result_rejects_completion_before_start_for_completed_status():
+    with pytest.raises(ValidationError, match="Completion cannot precede scan start"):
+        ScanResult(
+            target=ScanTarget(url="https://example.com"),
+            status=ScanStatus.COMPLETED,
+            started_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+            completed_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        )
+
+
+def test_failed_scan_serialization_contains_safe_error_only():
+    result = ScanResult(
+        target=ScanTarget(url="https://example.com"),
+        status=ScanStatus.FAILED,
+        started_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            completed_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+        error=ScanError(code=ScanErrorCode.CONNECTION_FAILED),
+    )
+
+    serialized = result.model_dump_json()
+
+    assert "connection_failed" in serialized
+    assert "A connection to the target could not be established." in serialized
+    assert "Traceback" not in serialized

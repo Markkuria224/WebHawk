@@ -4,6 +4,7 @@ from webhawk.core.safety import (
     TargetNotAuthorizedError,
     TargetPolicy,
     TargetSafetyError,
+    ResolutionError,
     UnsafeAddressError,
     authorize_target,
 )
@@ -139,4 +140,137 @@ def test_mapped_private_ipv6_cannot_bypass_network_authorization():
             "https://lab.example",
             policy,
             resolver=fake_resolver(["::ffff:192.168.1.10"]),
+        )
+
+
+def test_default_resolver_uses_getaddrinfo_and_deduplicates(monkeypatch):
+    import socket
+
+    from webhawk.core.safety import authorize_target
+
+    calls = []
+
+    def fake_getaddrinfo(hostname, port, type):
+        calls.append((hostname, port, type))
+
+        return [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("1.1.1.1", port)),
+        ]
+
+    monkeypatch.setattr(
+        "webhawk.core.safety.socket.getaddrinfo",
+        fake_getaddrinfo,
+    )
+
+    policy = TargetPolicy(
+        authorized_hosts=frozenset({"example.com"}),
+    )
+
+    result = authorize_target(
+        "https://example.com:8443",
+        policy,
+    )
+
+    assert calls == [
+        ("example.com", 8443, socket.SOCK_STREAM)
+    ]
+
+    assert set(result.approved_addresses) == {
+        "93.184.216.34",
+        "1.1.1.1",
+    }
+
+
+def test_ipv4_mapped_ipv6_authorization_network_is_rejected():
+    policy = TargetPolicy(
+        authorized_networks=("::ffff:192.168.1.0/120",),
+    )
+
+    with pytest.raises(TargetSafetyError):
+        authorize_target(
+            "https://example.com",
+            policy,
+        )
+
+
+def test_loopback_outside_authorized_network_is_rejected():
+    policy = TargetPolicy(
+        authorized_hosts=frozenset({"lab.example"}),
+        authorized_networks=("127.0.0.1/32",),
+        allow_loopback=True,
+    )
+
+    with pytest.raises(UnsafeAddressError):
+        authorize_target(
+            "http://lab.example",
+            policy,
+            resolver=fake_resolver(["127.0.0.2"]),
+        )
+
+
+def test_invalid_resolver_address_is_rejected():
+    policy = TargetPolicy(
+        authorized_hosts=frozenset({"example.com"}),
+    )
+
+    with pytest.raises(ResolutionError, match="invalid IP address"):
+        authorize_target(
+            "https://example.com",
+            policy,
+            resolver=fake_resolver(["not-an-ip-address"]),
+        )
+
+
+def test_public_ip_literal_can_be_explicitly_authorized():
+    policy = TargetPolicy(
+        authorized_hosts=frozenset({"93.184.216.34"}),
+    )
+
+    result = authorize_target(
+        "https://93.184.216.34",
+        policy,
+    )
+
+    assert result.approved_addresses == ("93.184.216.34",)
+
+
+def test_hostname_authorization_is_case_insensitive():
+    policy = TargetPolicy(
+        authorized_hosts=frozenset({"EXAMPLE.COM"}),
+    )
+
+    result = authorize_target(
+        "https://example.com",
+        policy,
+        resolver=fake_resolver(["93.184.216.34"]),
+    )
+
+    assert result.hostname == "example.com"
+
+
+def test_shared_address_space_is_rejected():
+    policy = TargetPolicy(
+        authorized_hosts=frozenset({"lab.example"}),
+    )
+
+    with pytest.raises(UnsafeAddressError):
+        authorize_target(
+            "https://lab.example",
+            policy,
+            resolver=fake_resolver(["100.64.0.1"]),
+        )
+
+
+def test_missing_hostname_is_rejected(monkeypatch):
+    monkeypatch.setattr(
+        "webhawk.core.safety.normalize_url",
+        lambda url: "http:///",
+    )
+
+    with pytest.raises(TargetSafetyError, match="hostname is missing"):
+        authorize_target(
+            "http://example.com",
+            TargetPolicy(),
         )
